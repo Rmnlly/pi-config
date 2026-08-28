@@ -52,26 +52,38 @@ function resolvePaneId(): string | null {
  *   CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND
  *   1         terminal_0     pi
  *
- * Returns null when focus can't be determined, so callers can distinguish
- * "nobody is watching" from "don't know".
+ * The command is intermittently unreliable — measured ~2 in 12 calls returning
+ * zero bytes. The two "no rows" cases are distinguishable, which matters:
+ *
+ *   0 bytes, no header  -> zellij didn't answer; UNKNOWN, worth retrying
+ *   header, no rows     -> genuinely no clients attached; nobody is looking
+ *
+ * Returns null only when genuinely unknown after retries.
  */
 async function focusedTerminalPanes(
   pi: ExtensionAPI,
 ): Promise<Set<string> | null> {
-  try {
-    const r = await pi.exec('zellij', ['action', 'list-clients'], {
-      timeout: PIPE_TIMEOUT_MS,
-    });
-    if (r.code !== 0 || !r.stdout) return null;
-    const ids = new Set<string>();
-    for (const line of r.stdout.split('\n')) {
-      const m = line.match(/^\s*\d+\s+terminal_(\d+)\s/);
-      if (m) ids.add(m[1]);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      // Healthy calls answer in milliseconds; a short timeout keeps a wedged
+      // zellij from stalling the turn.
+      const r = await pi.exec('zellij', ['action', 'list-clients'], {
+        timeout: 1000,
+      });
+      if (r.code === 0 && r.stdout && r.stdout.trim().length > 0) {
+        const ids = new Set<string>();
+        for (const line of r.stdout.split('\n')) {
+          const m = line.match(/^\s*\d+\s+terminal_(\d+)\s/);
+          if (m) ids.add(m[1]);
+        }
+        return ids;
+      }
+    } catch {
+      // fall through to retry
     }
-    return ids;
-  } catch {
-    return null;
+    await new Promise((res) => setTimeout(res, 150));
   }
+  return null;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -79,10 +91,13 @@ export default function (pi: ExtensionAPI) {
     const paneId = resolvePaneId();
     if (!paneId) return;
 
-    // You're looking right at it — marking would be noise, and the icon would
-    // linger until you switched tabs. If focus is indeterminate, fall through
-    // and mark: a stray icon beats a missed notification.
+    // Skip if you're looking right at it. Also skip when focus is genuinely
+    // unknown: marking a focused pane makes the plugin orphan the icon — it
+    // clears its own state on focus but refuses to strip the tab name, so the
+    // ✅ survives switching away and only a detach/reattach clears it. A missed
+    // notification is recoverable; an orphaned icon is not.
     const focused = await focusedTerminalPanes(pi);
+    if (focused === null) return;
     if (focused?.has(paneId)) return;
 
     try {
