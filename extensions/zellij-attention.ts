@@ -14,6 +14,12 @@
  * follow-ups afterwards. `agent_settled` fires once, when pi will not continue
  * on its own — which is exactly "ready for you".
  *
+ * Skips the mark when a client is already focused on pi's pane. Without that
+ * check, the tab you're actively working in gets re-marked every single turn,
+ * and the plugin only strips the icon once focus *leaves* the pane — so it
+ * reads as a permanently stuck ✅. The signal only means something when
+ * you're somewhere else.
+ *
  * No-ops safely outside Zellij (plain terminal, SSH, CI) and never throws:
  * a cosmetic notification must not be able to disturb a session.
  */
@@ -39,10 +45,45 @@ function resolvePaneId(): string | null {
   return /^\d+$/.test(id) ? id : null;
 }
 
+/**
+ * Pane ids currently focused by connected clients, parsed from
+ * `zellij action list-clients`:
+ *
+ *   CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND
+ *   1         terminal_0     pi
+ *
+ * Returns null when focus can't be determined, so callers can distinguish
+ * "nobody is watching" from "don't know".
+ */
+async function focusedTerminalPanes(
+  pi: ExtensionAPI,
+): Promise<Set<string> | null> {
+  try {
+    const r = await pi.exec('zellij', ['action', 'list-clients'], {
+      timeout: PIPE_TIMEOUT_MS,
+    });
+    if (r.code !== 0 || !r.stdout) return null;
+    const ids = new Set<string>();
+    for (const line of r.stdout.split('\n')) {
+      const m = line.match(/^\s*\d+\s+terminal_(\d+)\s/);
+      if (m) ids.add(m[1]);
+    }
+    return ids;
+  } catch {
+    return null;
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on('agent_settled', async () => {
     const paneId = resolvePaneId();
     if (!paneId) return;
+
+    // You're looking right at it — marking would be noise, and the icon would
+    // linger until you switched tabs. If focus is indeterminate, fall through
+    // and mark: a stray icon beats a missed notification.
+    const focused = await focusedTerminalPanes(pi);
+    if (focused?.has(paneId)) return;
 
     try {
       // Must be --name (broadcast). --plugin spawns a second plugin instance
